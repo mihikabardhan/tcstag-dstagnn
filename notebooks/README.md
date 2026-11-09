@@ -8,4 +8,4 @@
 | alignment and noise checks | Calendar-alignment check and graph-noise control | included |
 | conformal intervals | Time-aware conformal calibration study (variants A to F) | **TODO: copy `conformal_time_aware_pems04.ipynb` here** |
 
-Notebooks are committed without outputs to keep the repository small. The three TODO notebooks hold results that appear in the paper (regime graphs, calendar checks, and the interval study), so add them before sharing the repository.
+
