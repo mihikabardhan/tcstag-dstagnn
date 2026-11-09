@@ -1,0 +1,11 @@
+model,seed,MAE,RMSE,MAPE,best_epoch,sec_per_epoch,pipeline
+baseline,1,19.297,31.500,12.825,58,213,original baseline script
+baseline,2,19.440,31.809,12.866,60,213,original baseline script
+baseline,3,19.294,31.499,12.758,58,213,original baseline script
+baseline_control,2,19.385,31.375,12.829,50,234.5,tcstag runner (control run)
+te,1,19.168,31.397,12.590,51,234,tcstag runner
+te,2,19.114,31.139,12.658,40,216,tcstag runner
+te,3,19.219,31.398,12.756,49,240,tcstag runner
+tcstag,1,19.208,31.397,12.671,51,310,tcstag runner
+tcstag,2,19.202,31.406,12.703,42,287,tcstag runner
+tcstag,3,19.193,31.466,12.715,49,305,tcstag runner

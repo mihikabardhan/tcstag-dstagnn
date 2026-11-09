@@ -1,0 +1,557 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite,amsmath,amssymb,graphicx,booktabs,xcolor,array,url}
+\usepackage[T1]{fontenc}
+\newcommand{\todo}[1]{{\color{red}[TODO: #1]}}
+\newcommand{\figorbox}[2]{\IfFileExists{#1}{\includegraphics[width=\columnwidth]{#1}}{\fbox{\parbox{0.9\columnwidth}{\centering\small [figure file \detokenize{#1} missing: #2]}}}}
+\renewcommand{\arraystretch}{1.1}
+
+\begin{document}
+\title{Time-Aware Forecasting and Calibration for\\DSTAGNN: What Helps, What Does Not, and Why}
+
+\author{\IEEEauthorblockN{Mihika Bardhan, Harshith Velkumar, Jinay Hiran, and Advik Anand}
+\IEEEauthorblockA{Dept.\ of Information \& Communication Technology, Manipal Institute of Technology, Manipal, India\\
+Supervisor: \todo{supervisor name}}}
+\maketitle
+
+\begin{abstract}
+Graph-based traffic forecasters are usually judged by one accuracy number averaged over the day, although traffic behaves differently at rush hour, at midday and at weekends. We study time-awareness in DSTAGNN, whose spatial-temporal aware distance graph is computed once and then frozen. On PEMS04 we first reproduce DSTAGNN within 0.2\% of its published MAE (1.2\% on PEMS08) and report six issues in the released code. Second, adding time-of-day and day-of-week embeddings lowers MAE by 0.9\% over three seeds (19.167 vs.\ 19.344), in every regime and at every horizon. Third, we rebuild the graph per regime and show that these graphs differ from the global graph by more than sampling noise, yet a time-conditioned mixture of them gives no gain over the time embeddings alone (+0.03 MAE on three-seed ensembles, with 31\% longer training); a companion ablation suggests that the graph is a weak lever in this architecture. Fourth, calibrating conformal prediction intervals per time-of-day cell, or on forecast-level-scaled errors, lowers the interval score by 8\% to 10\% relative to a single global calibration and roughly halves the largest hourly coverage gap, whereas online adaptive conformal inference improves the interval score by only 2\%. We state what helps, what does not, and the limits of the evidence (three seeds, a 12-day test period, one dataset for the intervals).
+\end{abstract}
+
+\begin{IEEEkeywords}
+traffic forecasting, graph neural networks, DSTAGNN, conformal prediction, time-aware calibration, negative results
+\end{IEEEkeywords}
+
+\section{Introduction}
+Traffic flow forecasting is a core component of intelligent transportation systems, and graph neural networks are now the standard way to model how flow at one sensor depends on flow at others \cite{guo2019astgcn,li2017dcrnn,yu2017stgcn}. These models need a graph. Early work used the physical road network; later work learned the graph from data \cite{bai2020agcrn,fang2021stgode,li2021stfgnn,song2020stsgcn,wu2019gwnet}.
+
+DSTAGNN \cite{lan2022dstagnn} builds its graph from the historical data itself. For every sensor it forms the distribution of daily traffic volume, measures the Wasserstein distance between sensors (the Spatial-Temporal Aware Distance, STAD), and keeps each sensor's most similar neighbours (the STAG graph). Spatial attention then adjusts how strongly neighbours influence each other.
+
+\textbf{The gap.} Despite the name, the STAD graph is computed once from all training days and then frozen. Only the attention weights on top of it vary. Two sensors that behave alike during weekday rush hour are therefore connected exactly as strongly on a Sunday night, although traffic dependencies change with the time of day and the day of the week.
+
+\textbf{Our question.} Does making the dependency graph time-conditioned improve DSTAGNN, and can we answer with proper statistics rather than a single run? We find that the answer is mostly negative for the graph, and positive for two other kinds of time-awareness: time embeddings and time-aware uncertainty calibration.
+
+\textbf{Contributions.}
+\begin{enumerate}
+\item \emph{A reproduction and code audit.} We reproduce DSTAGNN on PEMS04 and PEMS08 and report six issues between the released code and the paper's description (Sections~\ref{sec:repro}, \ref{sec:code}).
+\item \emph{Time embeddings, measured with statistics.} Time-of-day and day-of-week embeddings reduce MAE by 0.9\% over three seeds, in every regime (0.7\%--1.2\%) and at every horizon (0.3\%--1.4\%); the gain survives ensembling (Section~\ref{sec:main}).
+\item \emph{Regime graphs and a negative result.} We rebuild the STAD graph per regime and show that the graphs differ by more than sampling noise (Section~\ref{sec:regimegraphs}), but a time-conditioned mixture of them does not improve accuracy over time embeddings alone and costs 31\% more training time. We give measured reasons why the graph is a weak lever (Sections~\ref{sec:method-mix} and \ref{sec:companion}).
+\item \emph{Time-aware prediction intervals.} Calibrating conformal intervals per time-of-day cell, or on forecast-level-scaled errors, lowers the interval score by 8\% to 10\% and halves the largest hourly coverage gap compared with a single global calibration; online adaptive conformal inference does not (Section~\ref{sec:intervals}).
+\end{enumerate}
+We do not claim that time-conditioned graphs or conformal prediction for traffic are new (Section~\ref{sec:related}); our contribution is a controlled, statistically checked study inside one well-known architecture.
+
+\section{Literature Survey}\label{sec:related}
+Traffic forecasting began with statistical and classical machine-learning models such as ARIMA and support vector regression, which treat every sensor on its own and cannot represent that a jam on one road spreads to its neighbours. Deep learning, and graph neural networks in particular, changed this by letting each sensor's forecast depend on the sensors around it \cite{li2017dcrnn,yu2017stgcn}. We organise the literature along the three questions of this paper: how spatial-temporal models use a graph and how much that graph matters (Sections~\ref{sec:ls-a} and \ref{sec:ls-b}), how time information and time-varying graphs are used (Section~\ref{sec:ls-c}), and how forecast uncertainty is quantified (Section~\ref{sec:ls-d}). Table~\ref{tab:survey} summarises the works closest to ours, and Section~\ref{sec:ls-e} states the gaps.
+
+\subsection{Graph-based spatial-temporal forecasting}\label{sec:ls-a}
+DCRNN \cite{li2017dcrnn} treats traffic as a diffusion process on the road graph and combines diffusion convolution with an encoder--decoder recurrent network; its recurrence makes training slow and long-range patterns hard to retain. STGCN \cite{yu2017stgcn} replaces recurrence with gated temporal convolutions placed between graph convolutions, which speeds up training. ASTGCN \cite{guo2019astgcn} adds spatial and temporal attention and models recent, daily and weekly components separately. STSGCN \cite{song2020stsgcn} runs convolutions over a localised graph that links each sensor to its neighbours at adjacent time steps, and STGODE \cite{fang2021stgode} and Z-GCNETs \cite{chen2021zgcnets} extend the family with continuous-depth and topological components. GMAN \cite{zheng2020gman} and PDFormer \cite{jiang2023pdformer} move further towards attention: GMAN uses spatial, temporal and transform attention in an encoder--decoder, and PDFormer adds propagation-delay awareness and short- and long-range spatial dependencies. DSTAGNN \cite{lan2022dstagnn}, our base model, combines multi-head spatial attention and Chebyshev graph convolution with multi-scale gated temporal convolutions on top of a data-driven graph.
+
+\subsection{Where the graph comes from, and how much it matters}\label{sec:ls-b}
+Early models use the physical road network or distances between sensors. Graph WaveNet \cite{wu2019gwnet} learns a self-adaptive adjacency matrix from node embeddings, and AGCRN \cite{bai2020agcrn} generates a data-adaptive graph together with node-specific parameters; in both, the graph is learned during training and fixed afterwards. STFGNN \cite{li2021stfgnn} fuses the spatial graph with a temporal-similarity graph built from the data. DSTAGNN builds its STAD graph from Wasserstein distances between the distributions of sensors' daily traffic volume \cite{lan2022dstagnn,panaretos2019}, again once, from all training days.
+
+A growing body of work questions how much the graph contributes. SimST \cite{liu2023simst} removes message passing and models spatial relations with sensor embeddings and a global module, and reports comparable accuracy at lower cost; STID \cite{shao2022stid} reaches strong results with an MLP that has no graph at all. Within DSTAGNN itself, replacing the road graph by the learned graph changes MAE on PEMS04 by only 0.11 \cite{lan2022dstagnn}. In our companion study \cite{companion}, shuffling the sensor labels of the graphs changed MAE by about 0.01, against about 0.1 of seed noise. These results suggest that conditioning a graph on time can only help if the graph reaches the model's output strongly enough, which we test in Sections~\ref{sec:regimegraphs} and \ref{sec:main}.
+
+\subsection{Time information and time-varying graphs}\label{sec:ls-c}
+Time of day and day of week are among the strongest signals in traffic data, and several models use them. ASTGCN models daily and weekly periodicity \cite{guo2019astgcn}, and GMAN encodes time in a spatio-temporal embedding \cite{zheng2020gman}. STID attaches learned time-in-day and day-in-week embeddings, together with a spatial identity, to an MLP \cite{shao2022stid}, and STAEformer shows that a vanilla Transformer with spatio-temporal adaptive embeddings is competitive with complex graph models \cite{liu2023staeformer}. Our \texttt{te} variant adds the same kind of embeddings to DSTAGNN; we do not propose them, we measure their effect inside an established graph model, with several seeds and with statistics.
+
+Making the graph itself depend on time is less common. DGCRN \cite{li2023dgcrn} uses hyper-networks to generate time-varying adjacency matrices from the current input and fuses them with a static road prior. A recent preprint \cite{patil2026} builds hour-conditioned adjacency matrices from an hourly coefficient-of-variation profile of a log-normal travel-time prior, perturbs edge weights with crash-severity signals, and combines a spatio-temporal Transformer with adaptive conformal prediction on Ohio traffic counts; the same authors earlier combined adaptive adjacency, weather-adjusted edge weights and adaptive conformal prediction in a GNN \cite{patil2025}. We read the abstracts and introductions of these preprints but did not reproduce them. Our approach differs in how the conditioned graphs are obtained (STAD distances between sensors' daily-volume distributions, rebuilt for each clock-defined regime, rather than travel-time variability or incident data), in the use of a learned gate to mix them inside DSTAGNN, and in that we report the mixture's negative result with seed-level statistics.
+
+\subsection{Uncertainty quantification and conformal prediction}\label{sec:ls-d}
+Most traffic models output point forecasts. Uncertainty has been added through Bayesian and ensemble methods that assume a parametric (often Gaussian) distribution \cite{qian2024uq}, and increasingly through conformal prediction, which wraps distribution-free intervals around any forecaster. Split conformal prediction \cite{lei2018} uses the quantile of absolute errors on a calibration set; it assumes exchangeability, which time series violate, and for traffic data this can lead to coverage far from the target \cite{dong2024castmgcn}. Adaptive conformal inference (ACI) \cite{gibbs2021aci} updates the miscoverage level online, conformal time-series forecasting \cite{stankeviciute2021cfrnn} corrects coverage over a multi-step horizon, and temporal quantile adjustments \cite{lin2022tqa} adjust the queried quantile. In traffic, conformal prediction has been combined with calibrated uncertainty for speed and flow \cite{wu2024adaptive}, with a causally-aware multi-graph network \cite{dong2024castmgcn}, and with adaptive-adjacency GNNs and Transformers \cite{patil2025,patil2026}. Interval quality is measured by coverage, width and the interval score \cite{gneiting2007}. Conformal prediction for traffic is therefore not new, and we do not claim it. What these works do not report, to our knowledge, is how coverage varies by hour of day for a single global calibration, or how much simple time-of-day cells or forecast-level scaling recover; this is the question of our Section~\ref{sec:intervals}.
+
+\begin{table*}[!t]
+\centering\caption{Literature summary: the works closest to this study.}\label{tab:survey}
+\scriptsize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.025\textwidth}>{\raggedright\arraybackslash}p{0.115\textwidth}>{\raggedright\arraybackslash}p{0.03\textwidth}>{\raggedright\arraybackslash}p{0.235\textwidth}>{\raggedright\arraybackslash}p{0.27\textwidth}>{\raggedright\arraybackslash}p{0.27\textwidth}@{}}
+\toprule
+No. & Author(s) & Year & Methods used & Key contribution & Limitation / relation to our study\\
+\midrule
+1 & Lan et al.\ (DSTAGNN) \cite{lan2022dstagnn} & 2022 & STAD graph from Wasserstein distances between daily-volume distributions; multi-head spatial attention; Chebyshev graph convolution; multi-scale gated temporal convolutions & Data-driven graph instead of road adjacency; strong results on PEMS benchmarks & Graph computed once from all training days and frozen; point forecasts only. Our base model\\
+2 & Li et al.\ (DCRNN) \cite{li2017dcrnn} & 2018 & Diffusion convolution on a directed graph; encoder--decoder RNN; scheduled sampling & Traffic modelled as a diffusion process on the road graph & Fixed road-distance graph; recurrent, comparatively slow to train\\
+3 & Yu et al.\ (STGCN) \cite{yu2017stgcn} & 2018 & Graph convolution with gated temporal convolutions & Removes recurrence, speeds up training & Predefined graph, no time-dependent structure\\
+4 & Guo et al.\ (ASTGCN) \cite{guo2019astgcn} & 2019 & Spatial and temporal attention; recent, daily and weekly components & Attention plus explicit periodicity & Attention over a fixed graph; point forecasts only\\
+5 & Wu et al.\ (Graph WaveNet) \cite{wu2019gwnet} & 2019 & Self-adaptive adjacency from node embeddings; dilated causal convolutions & Learns a graph without predefined topology & Graph fixed after training; no uncertainty estimates\\
+6 & Bai et al.\ (AGCRN) \cite{bai2020agcrn} & 2020 & Node-adaptive parameters; data-adaptive graph generation in a recurrent network & Each sensor learns its own patterns without a predefined graph & Graph fixed after training; point forecasts\\
+7 & Zheng et al.\ (GMAN) \cite{zheng2020gman} & 2020 & Spatial, temporal and transform attention; spatio-temporal embedding & Attention-based encoder--decoder that adapts spatial focus over time & Attention weights vary but no separate time-conditioned graph; point forecasts\\
+8 & Li and Zhu (STFGNN) \cite{li2021stfgnn} & 2021 & Spatial graph fused with a data-derived temporal-similarity graph; gated dilated convolutions & Temporal relations can themselves be a graph & Graphs built once from the data; not conditioned on time of day\\
+9 & Shao et al.\ (STID) \cite{shao2022stid} & 2022 & MLP with spatial, time-in-day and day-in-week identity embeddings & Simple baseline with strong accuracy and no graph & Same kind of time information as our \texttt{te}; we measure it inside DSTAGNN\\
+10 & Liu et al.\ (SimST) \cite{liu2023simst} & 2023 & Sensor embeddings and a global module instead of message passing & Comparable accuracy to graph models at lower cost & Supports our finding that the graph is a weak lever\\
+11 & Liu et al.\ (STAEformer) \cite{liu2023staeformer} & 2023 & Vanilla Transformer with spatio-temporal adaptive embeddings & Competitive with complex graph models & No time-conditioned graph; point forecasts\\
+12 & Li et al.\ (DGCRN) \cite{li2023dgcrn} & 2023 & Hyper-networks generate time-varying adjacency, fused with a static prior & Dynamic graph generated from the current input & Graph generated from input; ours is chosen by the clock and mixed by a gate\\
+13 & Patil et al.\ \cite{patil2025} & 2025 & Travel-time/CV-based adaptive adjacency modulated by weather; adaptive conformal prediction & Conformal intervals with a dynamic graph & Different data and forecaster; calibration not compared by hour of day\\
+14 & Patil et al.\ \cite{patil2026} & 2026 & Hour-conditioned adjacency from an hourly CV profile; crash-aware edge perturbation; spatio-temporal Transformer; ACP & Time-conditioned graph and conformal intervals on Ohio data & Closest to both our time-conditioned graph and our calibration; graph source and forecaster differ\\
+15 & Dong et al.\ (CASTMGCN) \cite{dong2024castmgcn} & 2024 & Causal graphs fused in a multi-graph network; conformal prediction with temporal quantile adjustment & Statistically valid intervals for non-exchangeable traffic data & Per-node adaptive calibration; not a comparison of time-of-day cells\\
+16 & Lei et al.\ \cite{lei2018} & 2018 & Split conformal prediction & Distribution-free intervals for any regressor & Exchangeability assumption; basis of our variants A--F\\
+17 & Gibbs and Cand\`es (ACI) \cite{gibbs2021aci} & 2021 & Online update of the miscoverage level & Coverage under distribution shift & Variant C of our study; improves the interval score by only about 2\%\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Gaps and positioning}\label{sec:ls-e}
+Across these works we see three gaps that this study addresses, with the caveat that we cover one base model and one main dataset. First, learned and data-driven graphs, including DSTAGNN's, are fixed after they are built, and the question whether conditioning them on time of day and day of week improves accuracy has, to our knowledge, not been tested inside DSTAGNN with seed-level statistics; we also report the negative result. Second, many studies report one average error over the whole test set; we report errors and calibration by regime, hour and horizon, and show that error is about 48\% higher at weekday peak. Third, conformal prediction is well established for traffic, but the effect of simple time-aware calibration choices on hourly coverage is rarely reported. Our contribution is therefore not a new architecture or new calibration theory, but a controlled study of what helps and what does not.
+
+\section{Background: DSTAGNN and STAD}
+\textbf{Problem.} A road network is a graph with $N$ sensors. Given the last $M=12$ steps of flow (5-minute resolution, so one hour), predict the next $T=12$ steps.
+
+\textbf{STAD} \cite[Eqs.~3--5]{lan2022dstagnn}. For sensor $n$, the vector $w_{nd}$ collects day $d$'s flow. Its length, normalised over days, gives a probability mass
+\begin{equation}
+m_{nd}=\frac{\lVert w_{nd}\rVert_2}{\sum_{d'}\lVert w_{nd'}\rVert_2}.
+\end{equation}
+The cost of moving mass between day $i$ at sensor $n_1$ and day $j$ at sensor $n_2$ is the cosine distance $1-\cos(w_{n_1 i},w_{n_2 j})$. STAD is the optimal-transport (Wasserstein) cost between the two distributions,
+\begin{equation}
+d_{\mathrm{STAD}}(n_1,n_2)=\inf_{\gamma\in\Pi[P_{n_1},P_{n_2}]}\sum_{i,j}\gamma_{ij}\bigl(1-\cos(w_{n_1 i},w_{n_2 j})\bigr),
+\end{equation}
+and $A_{\mathrm{STAD}}=1-d_{\mathrm{STAD}}$.
+
+\textbf{Graphs built from STAD.} For each node, keep the top-$k$ most similar nodes, with $k=\lfloor N\times P_{sp}\rfloor$ ($P_{sp}=0.01$ in the paper). Two matrices result: $A_{\mathrm{STAG}}$, used as the graph in the Chebyshev graph convolution, and $A_{\mathrm{STRG}}$, used as a prior added to the spatial attention.
+
+\textbf{How they enter the model.} In the released code, spatial attention scores are summed with $A_{\mathrm{STRG}}$ element-wise multiplied by a learned $N\times N$ matrix, passed through a softmax, and then multiplied element-wise with each Chebyshev term $T_k$ of the $A_{\mathrm{STAG}}$ graph.
+
+\section{Method: TC-STAG}\label{sec:method}
+\subsection{Regimes}
+We define three regimes from the clock: weekday peak (Monday to Friday, 07:00--10:00 and 16:00--19:00), weekday off-peak (all other weekday hours) and weekend (Saturday and Sunday). The peak windows are hand-chosen; the average daily profile on PEMS04 is a broad plateau from about 07:00 to 18:00 rather than two sharp peaks (Fig.~\ref{fig:align}).
+
+\subsection{Regime-specific STAD graphs}
+For each regime we repeat the STAD pipeline on the training days only (first 60\% of the time steps; 35 days for PEMS04, 37 for PEMS08), restricting each day's vector to the regime's time slots and each regime to its days. This yields $A^{(c)}_{\mathrm{STAD}}$, $A^{(c)}_{\mathrm{STRG}}$ and $A^{(c)}_{\mathrm{STAG}}$ for $c\in\{\text{peak},\text{off-peak},\text{weekend}\}$; the global graph (all days, all slots) is component 0, so there are $C=4$ components. We solve the transport problems with the POT library \cite{flamary2021pot} and verified against the authors' linear-programming implementation on real node pairs (maximum absolute difference 0). Computing the global PEMS04 graph takes about 11 seconds on a Kaggle CPU session.
+
+\subsection{Time embeddings}
+For the first prediction step $t$ we use embeddings of time of day (288 slots) and day of week (7), $E(t)=E_{\mathrm{tod}}(t)+E_{\mathrm{dow}}(t)$. They are added to the node embeddings entering the spatial-attention module and fused into the prediction head through a residual MLP whose last layer is zero-initialised, so training starts from the baseline function.
+
+\subsection{Time-conditioned graph mixture}\label{sec:method-mix}
+A gate maps time to mixture weights over the $C$ components,
+\begin{equation}
+w(t)=\mathrm{softmax}\bigl(\mathrm{MLP}([e_{\mathrm{tod}}(t);e_{\mathrm{dow}}(t)])\bigr)\in\Delta^{C-1},
+\end{equation}
+with the final layer initialised so that the global graph dominates (about 0.71 weight). We mix both the attention prior and the Chebyshev support:
+\begin{align}
+A_{\mathrm{STRG}}(t)&=\sum_{c=0}^{C-1}w_c(t)\,A^{(c)}_{\mathrm{STRG}},\\
+T_k(t)&=\sum_{c=0}^{C-1}w_c(t)\,T_k\bigl(\tilde L^{(c)}\bigr),\quad k=0,\dots,K-1,
+\end{align}
+where $\tilde L^{(c)}$ is the scaled Laplacian of component $c$'s STAG graph. When forced to the global graph, this model reproduces the authors' model exactly.
+
+\textbf{Why we mix the support as well.} In the released graph convolution, $T_k$ multiplies the attention matrix element-wise, so only entries inside the support of $T_k$ can influence the output. For PEMS04 that support has about 3 non-zeros per node (the same as the STAG graph). Only 22.7\% of the non-self edges of the peak-regime prior fall inside it (46\%--48\% for off-peak and weekend). A time-varying prior alone can therefore only reweight a handful of existing edges. We implemented a prior-only variant (\texttt{tcstag\_prior}) for this reason, but did not train it to completion (Section~\ref{sec:ablation}); we therefore state this as the motivation for mixing the support, not as a tested result.
+
+\subsection{Variants and cost}
+Table~\ref{tab:variants} lists the variants. TC-STAG has 3.85M parameters against 3.58M for the baseline (+7.6\%). In our runs \texttt{te} needs about 230 s per epoch and TC-STAG about 301 s (31\% more), that is about 3.8 h and 5.0 h per 60-epoch run on a T4.
+
+\begin{table}[t]
+\centering\caption{Model variants.}\label{tab:variants}
+\footnotesize
+\begin{tabular}{@{}p{1.8cm}cp{2.2cm}p{2.1cm}@{}}
+\toprule
+Name & Time emb. & Graph & Status\\
+\midrule
+DSTAGNN & no & global & 3 seeds\\
+\texttt{te} & yes & global & 3 seeds\\
+TC-STAG & yes & mixture, prior + support & 3 seeds\\
+\texttt{tcstag\_prior} & yes & mixture, prior only & implemented, not run\\
+\texttt{hard} & no & regime by clock & implemented, not run\\
+\texttt{soft\_static} & no & fixed mixture & implemented, not run\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Time-aware conformal calibration}\label{sec:conformal}
+Given a trained point forecaster, we wrap prediction intervals around its forecasts with split conformal prediction. For node $n$ and horizon $h$, the score of a calibration window is $s=|y-\hat y|$, or $s=|y-\hat y|/(\max(\hat y,0)+20)$ when scores are scaled by the forecast level (20 vehicles per 5 minutes avoids division by tiny forecasts). The interval half-width is the empirical $\lceil(|\mathcal C|+1)(1-\alpha)\rceil/|\mathcal C|$ quantile of the scores in the calibration set $\mathcal C$, and the interval is $\hat y\pm$ half-width (multiplied by the forecast level for scaled scores). The variants differ in which calibration windows share a set; the calibration windows are the validation windows, and all intervals are evaluated on the later test windows.
+\begin{itemize}
+\item \textbf{A, static:} one set for all windows.
+\item \textbf{B, regime:} one set per regime (3 cells).
+\item \textbf{C, ACI:} adaptive conformal inference \cite{gibbs2021aci} with step size 0.005, started from the quantiles of A and using the true feedback delay (the horizon-$h$ target of a window is observed $h+1$ steps later).
+\item \textbf{D, flow-normalised:} one set for all windows, scores scaled by the forecast level.
+\item \textbf{E, time-of-day cells:} six 4-hour bins $\times$ weekday or weekend (12 cells).
+\item \textbf{F, regime + flow-normalised:} B with scaled scores.
+\end{itemize}
+We report coverage per regime and per hour of the day, the mean interval width, and the interval score \cite{gneiting2007}
+\begin{equation}
+\mathrm{IS}_\alpha=(u-l)+\tfrac{2}{\alpha}(l-y)_++\tfrac{2}{\alpha}(y-u)_+,
+\end{equation}
+where $[l,u]$ is the interval (lower is better).
+
+\section{Experimental Setup}
+\textbf{Data.} Two public Caltrans PeMS datasets \cite{song2020stsgcn}, 5-minute resolution, split 6:2:2 in time (Table~\ref{tab:data}). The PEMS04 test windows cover Saturday 17 to Wednesday 28 February 2018 (verified from the timestamps): 8 weekdays, one of them the holiday Monday 19 February, and 4 weekend days. The first test day starts at 04:15.
+
+\begin{table}[t]
+\centering\caption{Datasets.}\label{tab:data}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lrrrlr@{}}
+\toprule
+Dataset & Sensors & Steps & Days & Documented start & Test windows\\
+\midrule
+PEMS04 & 307 & 16,992 & 59 & Mon 1 Jan 2018 & 3,394\\
+PEMS08 & 170 & 17,856 & 62 & Fri 1 Jul 2016 & 3,567\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\label{sec:calendar}\textbf{Calendar verification.} Our regimes depend on the weekday of each time step, so we checked it on both datasets (Fig.~\ref{fig:align}). On PEMS04 the documented start (Monday) is supported by the data: the two lowest-flow weekdays are Saturday and Sunday (median daily flow 206.6 and 179.0, against 211.9 to 231.8 on weekdays), the holiday Monday 1 January is visibly low, and the average daily profile has its trough at 02:45, so slot 0 is midnight. The same holds on PEMS08 (documented start Friday 1 July 2016): Saturday and Sunday are the two lowest weekdays (medians 228.4 and 204.2, against 231.5 to 250.0), the holiday Monday 4 July is low, and the trough is at 02:35. An automatic detector that picks the offset with the lowest weekend flow wrongly preferred a one-day shift on both datasets (offsets 0 and 6 differ by only 0.003 in the weekend-to-weekday ratio on PEMS04; offsets 3 and 4 tie on PEMS08), because Mondays, and holidays that fall on Mondays, have low flow. We therefore use the documented dates (offset 0 for PEMS04, 4 for PEMS08).
+
+\begin{figure}[t]
+\centering\figorbox{alignment_checks.png}{average daily flow profile, PEMS04 and PEMS08}
+\caption{Average daily flow profile (mean over all days and sensors) on PEMS04 (left) and PEMS08 (right). The night trough is at 02:45 and 02:35, so slot 0 is midnight. The profile is a broad plateau from about 07:00 to 18:00 rather than two sharp rush-hour peaks; shaded areas are our hand-chosen peak windows.}\label{fig:align}
+\end{figure}
+
+\textbf{Training.} Input 12 steps, output 12 steps. Adam, learning rate $10^{-4}$, batch size 32, Huber loss with threshold 1, 4 spatial-temporal blocks, $K=3$ Chebyshev terms, 3 temporal and 3 spatial attention heads, multi-scale gated convolution kernels $\{3,5,7\}$, pooling window 2 (all as in \cite{lan2022dstagnn}). Differences from the original: at most 60 epochs (the paper trains 100), early stopping with patience 15 on the validation loss, best-validation checkpoint evaluated on the test set. Hardware: Kaggle NVIDIA T4 GPUs, about 213--240 s per epoch for the baseline and \texttt{te}, and about 300 s for TC-STAG.
+
+\textbf{Metrics.} MAE, RMSE and MAPE (\%), averaged over all 12 horizons and all nodes, and per horizon.
+
+\textbf{Seeds and statistics.} Three seeds per model, reported as mean $\pm$ standard deviation. Welch's $t$-test on seed-level MAE is indicative only with $n=3$. We add a day-block bootstrap (resampling whole test days, 4,000 draws) for paired differences between models; it captures variation across test days, not across seeds, so we report both.
+
+\textbf{Baselines.} Our retrained DSTAGNN (the learned STAG graph as the Chebyshev graph), and the numbers published by \cite{lan2022dstagnn}. The baseline was trained with a script written by one author, and \texttt{te} and TC-STAG with a shared runner; Section~\ref{sec:main} describes a control run that checks for a pipeline effect.
+
+\section{Results}
+\subsection{Reproducing DSTAGNN}\label{sec:repro}
+Table~\ref{tab:repro} shows that our retrained DSTAGNN is within 0.2\% to 1.2\% of the published MAE. PEMS04 per seed (MAE): 19.297, 19.440, 19.294 (best epochs 58, 60, 58 of a 60-epoch cap). PEMS08 per seed (MAE): 15.768, 16.043, 15.759.
+
+\begin{table}[t]
+\centering\caption{Reproduction of DSTAGNN.}\label{tab:repro}
+\footnotesize
+\begin{tabular}{@{}llrrr@{}}
+\toprule
+Dataset & Metric & Ours (3 seeds) & Paper & Gap\\
+\midrule
+PEMS04 & MAE & $19.344\pm0.083$ & 19.30 & +0.23\%\\
+PEMS04 & RMSE & $31.603\pm0.179$ & 31.46 & +0.45\%\\
+PEMS04 & MAPE (\%) & $12.817\pm0.055$ & 12.70 & +0.92\%\\
+PEMS08 & MAE & $15.857\pm0.162$ & 15.67 & +1.2\%\\
+PEMS08 & RMSE & 24.942 & 24.77 & +0.7\%\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{PEMS08 caveat.} The authors do not ship a PEMS08 graph, and their sparsity $P_{sp}=0.01$ would leave one neighbour per node. We generated graphs with $P_{sp}=0.02$ (three entries per node, as on PEMS04). The PEMS08 baseline runs were made before this change, so we treat the PEMS08 numbers as supplementary. \todo{confirm with Jinay which PEMS08 graph the baseline used; rerun or keep this sentence}
+
+\subsection{Reproducing the STAG graph}
+Using the authors' shipped PEMS04 files as ground truth, our Wasserstein pipeline reproduces 90.9\% of the STAG rows exactly (mean neighbour overlap 94.7\%) and 89.9\% of the STRG rows (mean Jaccard 93.8\%). The remaining rows are exact similarity ties between sensors with identical distributions (14 of the 307 rows).
+
+\subsection{Regime graphs differ from the global graph}\label{sec:regimegraphs}
+Table~\ref{tab:jacc} gives the mean Jaccard overlap of each node's top-$k$ neighbour set ($k=5\%$ of nodes: 15 for PEMS04, 8 for PEMS08).
+\begin{table}[t]
+\centering\caption{Mean Jaccard overlap of neighbour sets between graphs (1 = identical).}\label{tab:jacc}
+\footnotesize
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Pair & PEMS04 & PEMS08\\
+\midrule
+global vs.\ peak & 0.291 & 0.360\\
+global vs.\ off-peak & 0.583 & 0.660\\
+global vs.\ weekend & 0.274 & 0.371\\
+peak vs.\ off-peak & 0.226 & 0.316\\
+peak vs.\ weekend & 0.167 & 0.243\\
+off-peak vs.\ weekend & 0.241 & 0.342\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Noise control.} The peak and weekend graphs use fewer slots or days, so some difference is expected from sampling alone. We therefore split the days of each regime at random into two halves, rebuilt the graph from each half and measured the overlap (Table~\ref{tab:split}; mean of 2 random splits). Every cross-regime overlap between regime graphs (0.17--0.24 on PEMS04, 0.24--0.34 on PEMS08) is well below the split-half overlap of each regime (0.45--0.66). Each half uses only half of the days, so the split-half values understate how reproducible the full-data graphs are; the comparison is therefore conservative. We conclude that the regime graphs differ by more than sampling noise.
+\begin{table}[t]
+\centering\caption{Jaccard overlap at $k=5\%$ between graphs built from two random halves of the days of the same regime.}\label{tab:split}
+\footnotesize
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Regime & PEMS04 & PEMS08\\
+\midrule
+peak & 0.505 & 0.531\\
+off-peak & 0.659 & 0.646\\
+weekend & 0.452 & 0.509\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Main results}\label{sec:main}
+Table~\ref{tab:main} gives the PEMS04 results. Time embeddings lower MAE from $19.344$ to $19.167$ ($-0.91\%$; Welch $p\approx0.045$, indicative), RMSE by 0.92\% and MAPE by 1.16\%. TC-STAG lowers MAE by 0.74\% ($p\approx0.096$) but is not better than \texttt{te}.
+\begin{table*}[t]
+\centering\caption{Main results on PEMS04 (3 seeds, mean $\pm$ SD; percentages are changes against our DSTAGNN).}\label{tab:main}
+\footnotesize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Model & MAE & RMSE & MAPE (\%)\\
+\midrule
+DSTAGNN (paper) & 19.30 & 31.46 & 12.70\\
+DSTAGNN (ours) & $19.344\pm0.083$ & $31.603\pm0.179$ & $12.817\pm0.055$\\
++ time embeddings (\texttt{te}) & $19.167\pm0.053$ ($-0.91\%$) & $31.311\pm0.149$ ($-0.92\%$) & $12.668\pm0.083$ ($-1.16\%$)\\
+TC-STAG & $19.201\pm0.008$ ($-0.74\%$) & $31.423\pm0.038$ ($-0.57\%$) & $12.696\pm0.023$ ($-0.94\%$)\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\textbf{TC-STAG against \texttt{te}.} The per-seed MAE differences (TC-STAG minus \texttt{te}) are $+0.040$, $+0.088$ and $-0.026$ (mean $+0.034$, SD 0.057, paired $p\approx0.41$), smaller than the seed-to-seed spread of \texttt{te} (0.053) and of the baseline (0.083). For the three-seed ensembles the day-block bootstrap gives $+0.032$ MAE with a 95\% interval of $[+0.009,+0.059]$ (Table~\ref{tab:paired}). Read together, the graph mixture gives no accuracy gain over time embeddings alone, and is at best marginally worse (0.17\%); the interval covers test-day variation only, and the sign flips across seeds.
+\begin{table}[t]
+\centering\caption{Paired MAE differences on PEMS04 (positive = first model worse). Intervals are 95\% day-block bootstrap over 12 test days (8 weekdays and 4 weekend days for the regime rows).}\label{tab:paired}
+\footnotesize
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Comparison & Diff. & 95\% interval\\
+\midrule
+TC-STAG $-$ \texttt{te}, seed 1 & $+0.040$ & $[-0.012,+0.088]$\\
+TC-STAG $-$ \texttt{te}, seed 2 & $+0.088$ & $[+0.038,+0.144]$\\
+TC-STAG $-$ \texttt{te}, seed 3 & $-0.026$ & $[-0.085,+0.035]$\\
+TC-STAG $-$ \texttt{te}, ensembles & $+0.032$ & $[+0.009,+0.059]$\\
+\quad weekday peak (8 days) & $+0.065$ & $[+0.019,+0.124]$\\
+\quad weekday off-peak (8 days) & $-0.004$ & $[-0.023,+0.015]$\\
+\quad weekend (4 days) & $+0.071$ & $[+0.040,+0.118]$\\
+\texttt{te} $-$ DSTAGNN, ensembles & $-0.166$ & $[-0.238,-0.100]$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Ensembles.} Averaging the three seeds gives MAE 18.959 for DSTAGNN, 18.793 for \texttt{te} ($-0.88\%$) and 18.825 for TC-STAG ($-0.71\%$). The \texttt{te} gain therefore survives ensembling. Mixing \texttt{te} and TC-STAG models gives no diversity bonus.
+
+\textbf{Control for the training pipeline.} To check whether part of the gain comes from using a different training script, we retrained the baseline (seed 2) in the runner used for \texttt{te} and TC-STAG. It reached MAE 19.385 (RMSE 31.375, MAPE 12.829) against 19.440 from the original script for the same seed, a difference of 0.055 (0.28\%), inside the seed spread of 0.083. Against this control, \texttt{te} (seed 2) is 0.271 lower ($-1.40\%$) and TC-STAG 0.183 lower ($-0.94\%$). Replacing the original seed 2 by the control gives a baseline mean of 19.325, so \texttt{te} is $-0.82\%$ and TC-STAG $-0.64\%$. This is one seed and cannot rule out a pipeline effect of about 0.1 MAE.
+
+\subsection{Decomposing the effect}\label{sec:ablation}
+Table~\ref{tab:paired} and Table~\ref{tab:main} already decompose the change: adding time embeddings gives the gain; adding the graph mixture on top changes MAE by $+0.034$ on average and by $+0.032$ for ensembles, that is, nothing we can distinguish from noise. We implemented three further variants (prior-only mixture, regime graph chosen by the clock, and a fixed non-time-dependent mixture; Table~\ref{tab:variants}), and each ran a smoke test, but at 4--5 hours per run on a T4 we did not train them to completion; we therefore make no claim about them, and in particular we have not tested whether mixing the support is necessary. The full TC-STAG, which does change the support, gave no gain, which is consistent with the graph being a weak lever (Section~\ref{sec:companion}).
+
+\subsection{Error by regime and horizon}\label{sec:regimehorizon}
+Errors concentrate at weekday peak (Table~\ref{tab:regime}): the baseline's test MAE there is 26.1, against 17.6 off-peak and 18.5 on weekends (about 48\% higher than off-peak). Time embeddings help in every regime (0.7\%--1.2\%) and at every horizon (0.3\%--1.4\%, Table~\ref{tab:horizon}); the gain is smallest at the longest horizon (step 12). TC-STAG is no better than \texttt{te} in any regime and is slightly worse than the baseline at step 12 ($+0.14\%$). The PEMS04 test set covers only about 12 days (8 weekdays, one of them the holiday Monday 19 February, and 4 weekend days), so regime-level results rest on very few days.
+\begin{table}[t]
+\centering\caption{Test MAE by regime on PEMS04 (mean of 3 seeds).}\label{tab:regime}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Model & Weekday peak & Weekday off-peak & Weekend\\
+\midrule
+DSTAGNN (ours) & 26.144 & 17.612 & 18.488\\
+\texttt{te} & 25.823 ($-1.23\%$) & 17.482 ($-0.73\%$) & 18.312 ($-0.95\%$)\\
+TC-STAG & 25.904 ($-0.92\%$) & 17.474 ($-0.78\%$) & 18.387 ($-0.54\%$)\\
+\bottomrule
+\end{tabular}}
+\end{table}
+\begin{table*}[t]
+\centering\caption{Test MAE by prediction step on PEMS04 (mean of 3 seeds).}\label{tab:horizon}
+\footnotesize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Model & step 1 & step 3 & step 6 & step 9 & step 12\\
+\midrule
+DSTAGNN (ours) & 17.372 & 18.417 & 19.350 & 20.030 & 20.998\\
+\texttt{te} & 17.225 ($-0.85\%$) & 18.216 ($-1.09\%$) & 19.078 ($-1.41\%$) & 19.882 ($-0.74\%$) & 20.936 ($-0.30\%$)\\
+TC-STAG & 17.236 ($-0.78\%$) & 18.206 ($-1.15\%$) & 19.109 ($-1.25\%$) & 19.924 ($-0.53\%$) & 21.028 ($+0.14\%$)\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\subsection{What the gate learned}
+The gate did learn time structure. On seed 1 the weight of the weekend component rises from 0.26 on weekdays to 0.38--0.42 on Saturday and Sunday, while the peak graph gets little weight (0.07--0.11). On seed 3 the weekend component's mean weight rises from 0.116 on weekdays to 0.186 at weekends, and the range of each weight over the week is 0.26 (global), 0.13 (peak), 0.33 (off-peak) and 0.21 (weekend) (Fig.~\ref{fig:gate}). Seed 2 is weaker (weekend weight 0.17--0.22), and the patterns correlate only weakly between seeds (0.2 to 0.57). The model therefore picked up a weekday/weekend distinction, but the signal did not translate into accuracy, and it is unstable across seeds.
+\begin{figure}[t]
+\centering\figorbox{gate_weights_over_day.png}{learned mixture weights over the day, mean over 3 seeds}
+\caption{Learned mixture weights of the four graph components over the day on PEMS04 (mean over three seeds), for weekdays (left) and weekends (right).}\label{fig:gate}
+\end{figure}
+
+\subsection{Time-aware prediction intervals}\label{sec:intervals}
+We calibrate on the validation days (5 to 16 February) of PEMS04 and test on the following 12 days, using the three retrained DSTAGNN baseline models (seeds 1--3; the intervals depend on the model's errors, so seeds change the numbers only slightly). Table~\ref{tab:cp} shows nominal 90\% intervals.
+
+\textbf{A single global calibration is right on average but wrong at the wrong times.} Method A covers 89.6\% of all test values, but 82.0\% (95\% day-block interval [81.0, 83.0]) in the weekday-peak windows and only 77.9\% in the worst hour (14:00), while it over-covers at night (99\% to 100\%, Fig.~\ref{fig:cp}). ACI restores the average (90.0\%) but changes little where the errors are (peak coverage 83.8\%).
+
+\textbf{Regimes fix the peak but are too coarse.} Method B raises peak coverage to 89.4\%, but its off-peak cell mixes quiet nights with busy midday, so the worst hour becomes worse (74.5\%).
+
+\textbf{Time-of-day cells and forecast-level scaling fix both.} Methods D, E and F reduce the largest hourly gap from 12.1 to 6.3--7.2 points and the interval score by 11.4, 13.0 and 10.5 points (8\% to 10\%). The 95\% day-block bootstrap intervals for the difference to A are $[-13.7,-9.1]$, $[-14.9,-10.8]$ and $[-13.1,-7.8]$, so none includes zero; for B and ACI the improvements are only 1.6 and 2.5 points. The ranking is the same at 95\% and 80\% nominal coverage (Table~\ref{tab:cp2}). The differences among D, E and F are small, and we compared six variants on the same test period, so we do not claim that one of them is best; the robust finding is that time-aware or level-aware calibration clearly beats global calibration and ACI. A likely reason is that absolute errors grow with traffic volume, which level-scaling and time-of-day cells both absorb; in a companion study, daily MAE rose with daily traffic (Spearman $+0.47$) while MAPE fell ($-0.67$) \cite{companion}.
+
+\begin{table*}[t]
+\centering\caption{Nominal 90\% intervals on the PEMS04 test days, mean over three baseline seeds. Peak, off-peak and weekend are coverage (\%) on the windows of each regime; worst hour is the lowest coverage over the 24 hours of weekdays and the maximum hourly gap is the largest deviation from 90\%.}\label{tab:cp}
+\footnotesize
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+Method & Peak & Off-peak & Weekend & Worst hour (\%) & Max.\ hourly gap (pts) & Mean width & Interval score\\
+\midrule
+A static & 82.0 & 91.3 & 90.8 & 77.9 & 12.1 & 88.1 & 132.1\\
+B regime (3 cells) & 89.4 & 89.7 & 88.2 & 74.5 & 15.5 & 85.9 & 130.5\\
+C ACI (online) & 83.8 & 91.6 & 90.7 & 78.6 & 11.4 & 89.4 & 129.5\\
+D flow-normalised & 91.6 & 88.7 & 89.2 & 83.1 & 6.9 & 88.9 & 120.7\\
+E time-of-day cells & 86.9 & 90.3 & 89.7 & 83.8 & 7.2 & 83.4 & 119.1\\
+F regime + flow-norm. & 89.1 & 89.2 & 90.3 & 83.7 & 6.3 & 89.7 & 121.6\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{figure}[t]
+\centering\figorbox{fig_conformal_by_hour.png}{coverage and width of 90\% intervals by hour of day}
+\caption{Coverage (left) and mean width (right) of nominal 90\% intervals by hour of day on test weekdays, mean over three seeds. The static calibration over-covers at night and under-covers during the day; the time-aware calibrations keep coverage close to 90\% at the cost of wider intervals when flow is high and narrower ones at night.}\label{fig:cp}
+\end{figure}
+
+\begin{table}[t]
+\centering\caption{The comparison of Table~\ref{tab:cp} at 95\% and 80\% nominal coverage (mean over three seeds).}\label{tab:cp2}
+\footnotesize
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{Interval score} & \multicolumn{2}{c}{Max.\ hourly gap}\\
+Method & 95\% & 80\% & 95\% & 80\%\\
+\midrule
+A static & 163.6 & 102.7 & 7.8 & 19.2\\
+B regime (3 cells) & 162.4 & 101.5 & 10.0 & 21.4\\
+C ACI (online) & 162.2 & 101.2 & 7.2 & 19.3\\
+D flow-normalised & 153.4 & 94.3 & 4.8 & 8.5\\
+E time-of-day cells & 146.5 & 94.6 & 4.0 & 12.6\\
+F regime + flow-norm. & 154.1 & 94.7 & 4.3 & 7.8\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Caveats.} Only the baseline forecaster is calibrated (the models with time embeddings have no saved validation predictions); the calibration set is 12 days and the test set 12 days of one dataset; overlapping windows are not exchangeable, so the finite-sample guarantee holds only approximately; and the hourly coverage of the 12-cell calibration (E) shows dips at the bin edges.
+
+\section{Findings About the Released Code}\label{sec:code}
+\begin{enumerate}
+\item \textbf{Shipped graph differs from the released generator.} The shipped PEMS04 STAG file contains each node itself plus two neighbours (293 of 307 rows have the diagonal entry), while the released \texttt{STAG\_gen.py} excludes the node itself. Adding the self-similarity reproduces 90.9\% of rows.
+\item \textbf{The attention prior is binarised.} The paper presents $A_{\mathrm{STRG}}$ as a graph with correlation weights, but the loader keeps only whether an entry is non-zero.
+\item \textbf{Chebyshev terms do not widen the neighbourhood.} The support of $T_k$ has 3.05 non-zeros per row for $K=3$, the same as the graph (measured). \todo{add the file and line of the Chebyshev function in lib/utils.py}
+\item \textbf{A normalisation layer is rebuilt on every forward pass.} A LayerNorm in the temporal-attention module is constructed inside \texttt{forward}, so its scale and shift are never trained. \todo{add file and line reference}
+\item \textbf{No graph for PEMS08 is shipped,} and $P_{sp}=0.01$ would give one neighbour per node. We use 0.02 (three entries per node, as on PEMS04).
+\item \textbf{Training protocol.} The released training script fixes the seed to 1 and has no early stopping. \todo{check the epoch count in the config against the paper's 100}
+\end{enumerate}
+\textbf{Limited leverage of the graph.} In the paper, replacing the road graph by the learned STAG changes MAE on PEMS04 from 19.41 to 19.30 (0.6\%). Any graph-conditioning gain is expected to be of that order.
+
+\textbf{Runtime issues.} In the companion study six fixes were needed to run the released code on current software, including SciPy incompatibilities in the Wasserstein graph generation, CPU/GPU device mismatches, and Xavier initialisation errors on zero-element tensors. In the present study we generated graphs with the POT library instead.
+
+\section{Complementary Evidence from a Companion Study}\label{sec:companion}
+A companion study by the same authors \cite{companion} examined DSTAGNN with a different pipeline: five-fold day-level cross-validation (each of the 59 days predicted by a model that never saw it), 15 training epochs, a single seed, and a cosine-similarity graph computed from all days. Its numbers are therefore not comparable with those above, and we do not mix them in one table; we cite them for four questions that bear on our results.
+
+\subsection{How much does the graph matter?}
+\begin{itemize}
+\item \textbf{Graph relabeling.} Randomly permuting the sensor labels of the graphs changed MAE by $-0.011$ and $+0.008$ on two seed-matched folds, against a seed-noise floor of $-0.119$ and $+0.099$ when repeating the real-graph run with another seed (Table~\ref{tab:relabel}). On those folds the graph carried no measurable information. A third fold used different seeds for its two arms and was excluded.
+\item \textbf{Cosine versus Wasserstein.} On the standard split, a cosine graph gave MAE 19.39 (RMSE 31.55, MAPE 12.80\%) against the published 19.30 (31.46, 12.70\%) for the Wasserstein graph, a difference of about 0.5\% in a single run.
+\item \textbf{A weak lever.} The graph reached the output through a term about 20,000 times smaller in magnitude than the attention term.
+\end{itemize}
+\begin{table}[t]
+\centering\caption{Graph relabeling ablation in the companion study (MAE differences).}\label{tab:relabel}
+\footnotesize
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Comparison & Fold 0 & Fold 2\\
+\midrule
+Both graphs relabeled $-$ real graph (seed 42) & $-0.011$ & $+0.008$\\
+Noise floor: real graph, seed 7 $-$ seed 42 & $-0.119$ & $+0.099$\\
+\bottomrule
+\end{tabular}
+\end{table}
+Together with the 0.6\% difference between road and learned graphs in the original paper, and our finding that regime graphs which differ strongly from the global one (Table~\ref{tab:jacc}) still gave no accuracy gain, this indicates that the graph is a weak lever on the output of DSTAGNN. We have shown this only on PEMS04. In that study 80\% of the edges added by an online graph update fell at mask positions the model had never trained, which resembles our observation that few edges of a regime prior lie inside the Chebyshev support (Section~\ref{sec:method-mix}); whether the two are one mechanism has not been checked in the code, so we report them separately.
+
+\subsection{Simple baselines and calendar features}
+Table~\ref{tab:oof} places DSTAGNN among simple models on the same folds. A small graph-free MLP (about 75k parameters, one sensor's last 12 steps, no sensor identity) reaches MAE 25.68; adding calendar features (time of day and a day-of-week slot) lowers it to 22.31, a 13\% drop, while DSTAGNN, which receives no calendar input, reaches 19.57. Time information therefore matters greatly for a model that cannot infer the time from its input, but adds only about 0.9\% when given to DSTAGNN as embeddings (Section~\ref{sec:main}). We conjecture that DSTAGNN's input window over 307 sensors already carries much of the time-of-day pattern; we did not test this.
+\begin{table}[t]
+\centering\caption{All-days out-of-fold results in the companion study (59 days, 5 folds, 15 epochs, seed 42).}\label{tab:oof}
+\footnotesize
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Model & MAE & MAPE (\%)\\
+\midrule
+DSTAGNN & 19.57 & 14.22\\
+MLP, flow + calendar features & 22.31 & 15.49\\
+MLP, flow only & 25.68 & 18.06\\
+Ridge & 28.50 & 24.68\\
+Persistence & 31.36 & 22.15\\
+Historical average & 36.92 & 29.05\\
+Seasonal naive & 41.70 & 29.58\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Error scale and the days that are hard}
+The companion study labels as ``hard'' the ten days whose daily flow profile deviates most from the all-day average profile. Using the calendar of Section~\ref{sec:calendar}, these ten PEMS04 days are eight Sundays, Saturday 13 January and the holiday Monday 1 January; the ten ``normal'' days are all weekdays. The score therefore mostly detects the weekly cycle and holidays, not incidents. DSTAGNN's MAE is lower on hard days (17.82 against 19.97; mean traffic 178.1 against 215.0) but its MAPE is higher (15.24\% against 14.48\%): the gap of $+0.76$ points has a 95\% interval of $[-0.10,+1.81]$ (permutation $p=0.16$) and falls to $+0.10$ after removing two outlier days, so there is no reliable hard-day weakness. Across days, MAE rises with daily traffic (Spearman $+0.47$) and MAPE falls with it ($-0.67$). Calendar-blind baselines, in contrast, deteriorate on those days (MAPE $+38.6$ points for the historical average and $+16.3$ for seasonal naive). Monte Carlo dropout uncertainty, once normalised for traffic volume, tracked error (ratio 1.02 against an error ratio of 0.99). The main point for the present paper is that absolute errors scale with flow, which is consistent with the success of forecast-level scaling and time-of-day cells in Section~\ref{sec:intervals}.
+
+\subsection{Online adaptation attempts}
+The companion study set out to fix the frozen graph with an online update: a drift detector triggering an exponentially weighted moving-average update of the graph. None of eight adaptation attempts helped (Table~\ref{tab:adapt}). The updater either had no effect or did harm: letting the model learn the blending weight $\beta$ left it near 1, and forcing the blended graph through layer normalisation densified the graph from 1.3\% to 6.6\% of entries and lowered accuracy by 23.6 points of MAPE. The drift detector, swept over 20 settings, fired 2.05 times as often on hard days as on normal days with untuned settings, and 3.94 times for the best of the 20 settings, which was tuned on the same four days and is therefore optimistic. These results are specific to DSTAGNN's design, where the graph is a weak lever; they do not show that online adaptation is impossible where the graph matters more.
+\begin{table}[t]
+\centering\caption{Adaptation attempts in the companion study (all negative).}\label{tab:adapt}
+\footnotesize
+\begin{tabular}{@{}llp{3.5cm}@{}}
+\toprule
+Level & Method & Result\\
+\midrule
+Graph & EWMA update & no effect\\
+Graph & learnable blend $\beta$ & no effect ($\beta\approx1$)\\
+Graph & forced LayerNorm & catastrophic ($-23.6$ pp MAPE)\\
+Weights & full fine-tuning & catastrophic\\
+Weights & last-layer fine-tuning & no effect\\
+Weights & attention-block fine-tuning & no effect or mild degradation\\
+Input & local renormalisation & catastrophic\\
+Training & hard-day loss reweighting ($3\times$) & no improvement vs.\ matched control\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Limitations}
+\begin{itemize}
+\item \textbf{Three seeds per model.} Seed spread on the baseline is about 0.08 MAE (0.4\%), so differences below about 0.1 MAE are not distinguishable from noise.
+\item \textbf{Training length.} Runs were capped at 60 epochs. The baseline's best epochs (58, 60, 58) were at or near the cap, so it may be slightly under-trained; the best epochs of \texttt{te} and TC-STAG were 40 to 52 and a control baseline in our runner peaked at epoch 50.
+\item \textbf{Pipeline.} \texttt{te} and TC-STAG were trained with a different script from the baseline; one control run differed by 0.055 MAE, but it is a single seed.
+\item \textbf{Test period.} The test set covers about 12 days; regime-level statements rest on few days and include a holiday and only 4 weekend days.
+\item \textbf{Weekend graph.} It is built from about 10 training days and is the noisiest.
+\item \textbf{Regimes} are hand-chosen, not learned; the worst coverage hour (14:00) lies outside both peak windows.
+\item \textbf{Ablations not run.} The prior-only, regime-by-clock and fixed-mixture variants were not trained to completion.
+\item \textbf{Intervals.} The calibration study covers one dataset and the baseline forecaster only, with 12 calibration and 12 test days.
+\item \textbf{Scope.} Two datasets, and no comparison with models newer than 2022 (no newer baselines were trained).
+\item \textbf{Companion study.} Its evidence on graph leverage, simple baselines and hard days comes from a different pipeline (random-day folds, 15 epochs, one seed, a cosine graph computed from all days, one dataset), and the hard-day set mostly coincides with Sundays.
+\item \textbf{PEMS08} uses a graph we generated (the authors do not ship theirs) at sparsity 0.02, a deviation from the paper's 0.01, and the baseline's graph needs confirmation.
+\end{itemize}
+
+\section{Conclusion}
+We reproduced DSTAGNN within about 1\% of its published error, audited the released code, and tested whether making its dependency graph time-aware helps. Time embeddings reduce MAE by about 0.9\% in every regime and at every horizon, but a time-conditioned mixture of regime graphs, whose graphs we show differ by more than sampling noise, gives no distinguishable gain on top of them and costs about 31\% more training time. The clearest gain comes from calibrating prediction intervals per time of day or by forecast level, which lowers the interval score by 8\% to 10\% and roughly halves the largest hourly coverage gap, while online adaptive conformal inference does not. Natural next steps are data-driven regimes, intervals for the better forecasters, more datasets and newer baselines.
+
+\begin{thebibliography}{99}
+\bibitem{bai2020agcrn} L.~Bai, L.~Yao, C.~Li, X.~Wang, and C.~Wang, ``Adaptive graph convolutional recurrent network for traffic forecasting,'' in \emph{NeurIPS}, vol.~33, 2020.
+\bibitem{bruna2013} J.~Bruna, W.~Zaremba, A.~Szlam, and Y.~LeCun, ``Spectral networks and locally connected networks on graphs,'' arXiv:1312.6203, 2013.
+\bibitem{chen2021zgcnets} Y.~Chen, I.~Segovia, and Y.~R. Gel, ``Z-GCNETs: Time zigzags at graph convolutional networks for time series forecasting,'' in \emph{ICML}, PMLR 139, 2021.
+\bibitem{defferrard2016} M.~Defferrard, X.~Bresson, and P.~Vandergheynst, ``Convolutional neural networks on graphs with fast localized spectral filtering,'' in \emph{NeurIPS}, vol.~29, 2016.
+\bibitem{fang2021stgode} Z.~Fang, Q.~Long, G.~Song, and K.~Xie, ``Spatial-temporal graph {ODE} networks for traffic flow forecasting,'' in \emph{KDD}, 2021.
+\bibitem{flamary2021pot} R.~Flamary \emph{et al.}, ``{POT}: Python optimal transport,'' \emph{J. Mach. Learn. Res.}, vol.~22, no.~78, 2021.
+\bibitem{gibbs2021aci} I.~Gibbs and E.~Cand{\`e}s, ``Adaptive conformal inference under distribution shift,'' in \emph{NeurIPS}, vol.~34, 2021.
+\bibitem{gneiting2007} T.~Gneiting and A.~E. Raftery, ``Strictly proper scoring rules, prediction, and estimation,'' \emph{J. Amer. Statist. Assoc.}, vol.~102, no.~477, 2007.
+\bibitem{guo2019astgcn} S.~Guo, Y.~Lin, N.~Feng, C.~Song, and H.~Wan, ``Attention based spatial-temporal graph convolutional networks for traffic flow forecasting,'' in \emph{AAAI}, 2019.
+\bibitem{jiang2023pdformer} J.~Jiang, C.~Han, W.~X. Zhao, and J.~Wang, ``{PDFormer}: Propagation delay-aware dynamic long-range transformer for traffic flow prediction,'' in \emph{AAAI}, 2023, pp.~4365--4373.
+\bibitem{kipf2016} T.~N. Kipf and M.~Welling, ``Semi-supervised classification with graph convolutional networks,'' arXiv:1609.02907, 2016.
+\bibitem{lan2022dstagnn} S.~Lan, Y.~Ma, W.~Huang, W.~Wang, H.~Yang, and P.~Li, ``{DSTAGNN}: Dynamic spatial-temporal aware graph neural network for traffic flow forecasting,'' in \emph{ICML}, PMLR 162, 2022, pp.~11716--11730.
+\bibitem{lei2018} J.~Lei, M.~G'Sell, A.~Rinaldo, R.~J. Tibshirani, and L.~Wasserman, ``Distribution-free predictive inference for regression,'' \emph{J. Amer. Statist. Assoc.}, vol.~113, no.~523, 2018.
+\bibitem{li2021stfgnn} M.~Li and Z.~Zhu, ``Spatial-temporal fusion graph neural networks for traffic flow forecasting,'' in \emph{AAAI}, 2021.
+\bibitem{li2017dcrnn} Y.~Li, R.~Yu, C.~Shahabi, and Y.~Liu, ``Diffusion convolutional recurrent neural network: Data-driven traffic forecasting,'' arXiv:1707.01926, 2017.
+\bibitem{li2023dgcrn} F.~Li \emph{et al.}, ``Dynamic graph convolutional recurrent network for traffic prediction: Benchmark and solution,'' \emph{ACM Trans. Knowl. Discov. Data}, vol.~17, no.~1, 2023.
+\bibitem{liu2023staeformer} H.~Liu \emph{et al.}, ``{STAEformer}: Spatio-temporal adaptive embedding makes vanilla transformer {SOTA} for traffic forecasting,'' in \emph{CIKM}, 2023, pp.~3835--3839.
+\bibitem{panaretos2019} V.~M. Panaretos and Y.~Zemel, ``Statistical aspects of Wasserstein distances,'' \emph{Annu. Rev. Stat. Appl.}, vol.~6, 2019.
+\bibitem{patil2026} M.~Patil \emph{et al.}, ``Long-horizon traffic forecasting via incident-aware conformal spatio-temporal transformers,'' arXiv:2603.16857, 2026.
+\bibitem{shao2022stid} Z.~Shao, Z.~Zhang, F.~Wang, W.~Wei, and Y.~Xu, ``Spatial-temporal identity: A simple yet effective baseline for multivariate time series forecasting,'' in \emph{CIKM}, 2022, pp.~4454--4458.
+\bibitem{song2020stsgcn} C.~Song, Y.~Lin, S.~Guo, and H.~Wan, ``Spatial-temporal synchronous graph convolutional networks: A new framework for spatial-temporal network data forecasting,'' in \emph{AAAI}, 2020.
+\bibitem{velickovic2017gat} P.~Veli{\v c}kovi{\'c}, G.~Cucurull, A.~Casanova, A.~Romero, P.~Li{\`o}, and Y.~Bengio, ``Graph attention networks,'' arXiv:1710.10903, 2017.
+\bibitem{wu2019gwnet} Z.~Wu, S.~Pan, G.~Long, J.~Jiang, and C.~Zhang, ``Graph {WaveNet} for deep spatial-temporal graph modeling,'' arXiv:1906.00121, 2019.
+\bibitem{yu2017stgcn} B.~Yu, H.~Yin, and Z.~Zhu, ``Spatio-temporal graph convolutional networks: A deep learning framework for traffic forecasting,'' arXiv:1709.04875, 2017.
+\bibitem{zheng2020gman} C.~Zheng, X.~Fan, C.~Wang, and J.~Qi, ``{GMAN}: A graph multi-attention network for traffic prediction,'' in \emph{AAAI}, 2020, pp.~1234--1241.
+\bibitem{companion} M.~Bardhan, J.~Hiran, A.~Anand, and H.~Velkumar, ``A careful re-evaluation of {DSTAGNN}: Hard-day evaluation, graph ablation, and the limits of online graph adaptation,'' unpublished manuscript, 2026.
+\bibitem{liu2023simst} X.~Liu, Y.~Liang, C.~Huang, H.~Hu, Y.~Cao, B.~Hooi, and R.~Zimmermann, ``Do we really need graph neural networks for traffic forecasting?'' arXiv:2301.12603, 2023.
+\bibitem{dong2024castmgcn} P.~Dong, X.-L. Wang, I.~Bose, K.~K.~H. Ng, X.~Zhang, and X.~Zhang, ``Causally-aware spatio-temporal multi-graph convolution network for accurate and reliable traffic prediction,'' arXiv:2408.13293, 2024.
+\bibitem{patil2025} M.~Patil, Q.~Ahmed, and S.~Midlam-Mohler, ``Travel time and weather-aware traffic forecasting in a conformal graph neural network framework,'' arXiv:2509.12043, 2025.
+\bibitem{stankeviciute2021cfrnn} K.~Stankeviciute, A.~M.~Alaa, and M.~van der Schaar, ``Conformal time-series forecasting,'' in \emph{NeurIPS}, vol.~34, 2021, pp.~6216--6228.
+\bibitem{lin2022tqa} Z.~Lin, S.~Trivedi, and J.~Sun, ``Conformal prediction with temporal quantile adjustments,'' in \emph{NeurIPS}, vol.~35, 2022, pp.~31017--31030.
+\bibitem{wu2024adaptive} Y.~Wu, Y.~Ye, A.~Zeb, J.~J. Yu, and Z.~Wang, ``Adaptive modeling of uncertainties for traffic forecasting,'' \emph{IEEE Trans. Intell. Transp. Syst.}, vol.~25, no.~4, pp.~4427--4442, 2024.
+\bibitem{qian2024uq} W.~Qian, Y.~Zhao, D.~Zhang, B.~Chen, K.~Zheng, and X.~Zhou, ``Towards a unified understanding of uncertainty quantification in traffic flow forecasting,'' \emph{IEEE Trans. Knowl. Data Eng.}, vol.~36, no.~5, pp.~2239--2256, 2024.
+\end{thebibliography}
+
+\appendix
+\section*{Appendix: Run Log and Reproducibility}
+\begin{table}[h]
+\centering\caption{Run log (Kaggle NVIDIA T4 GPUs). Seconds per epoch, best epoch and test MAE per seed.}\label{tab:runlog}
+\footnotesize
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Run & Sec./epoch & Best epoch & Test MAE\\
+\midrule
+DSTAGNN PEMS04, seeds 1--3 & $\approx$213 & 58, 60, 58 & 19.297, 19.440, 19.294\\
+DSTAGNN PEMS04, seed 2, our runner (control) & 234.5 & 50 & 19.385\\
+DSTAGNN PEMS08, seeds 1--3 & --- & --- & 15.768, 16.043, 15.759\\
+\texttt{te}, seeds 1--3 & 234, 216, 240 & 51, 40, 49 & 19.168, 19.114, 19.219\\
+TC-STAG, seeds 1--3 & 310, 287, 305 & 51, 42, 49 & 19.208, 19.202, 19.193\\
+\bottomrule
+\end{tabular}}
+\end{table}
+Per-seed RMSE: DSTAGNN 31.500, 31.809, 31.499; \texttt{te} 31.397, 31.139, 31.398; TC-STAG 31.397, 31.406, 31.466. Per-seed MAPE (\%): DSTAGNN 12.825, 12.866, 12.758; \texttt{te} 12.590, 12.658, 12.756; TC-STAG 12.671, 12.703, 12.715.
+
+\textbf{Corrections made during the study.} In the main study, our first training runner used the road graph instead of the learned STAG graph: the first baseline run scored 19.409, matching the original paper's road-graph variant (19.41), so those runs were discarded and the study uses retrained models. Our first graph mixture was nearly inert because only about 23\% of the peak-regime prior edges lay inside the Chebyshev support, so we rebuilt it to mix the support as well. An earlier comparison of regime graphs used a wrong weekday offset and wrongly suggested that the off-peak and weekend graphs were indistinguishable; it is corrected here. In the companion study, an earlier pipeline evaluated on training, validation and test windows combined (16,969 samples); every result from it was withdrawn, including the claim that a cosine graph beats the Wasserstein graph (MAE 18.16 against 19.30), a claimed 7\% hard-day weakness, an overconfidence claim for Monte Carlo dropout, and an early drift-detector sweep.
+
+\begin{itemize}
+\item \textbf{Code:} the authors' repository (SYLan2019/DSTAGNN) plus our \texttt{tcstag.py} model file and \texttt{runner\_tc.py}. \todo{link to our repository}
+\item \textbf{Data and graphs:} PEMS04 and PEMS08 from \cite{song2020stsgcn}; regime graphs published as the Kaggle dataset \texttt{mihikabardhan/tcstag-regime-graphs}.
+\item \textbf{Seeds and splits:} seeds 1, 2, 3; deterministic cuDNN; the same data split for every model (identical test windows verified across pipelines).
+\item \textbf{Software:} PyTorch 2.11.0 (CUDA 13.0) on Kaggle. \todo{add Python and other package versions from the notebook logs}
+\end{itemize}
+\end{document}

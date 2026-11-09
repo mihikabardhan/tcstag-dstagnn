@@ -1,0 +1,25 @@
+# data and large outputs: never commit these (GitHub limit is 100 MB per file)
+third_party/
+data/
+*.npz
+*.pt
+*.pth
+runs/
+working/
+*.zip
+# python / notebooks
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+# secrets and OS files
+kaggle.json
+.env
+.DS_Store
+# latex build files
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.bbl
+paper/*.blg

@@ -1,0 +1,6 @@
+numpy
+pandas
+scipy
+torch>=2.0
+matplotlib
+POT          # python optimal transport, used to build the STAD graphs
